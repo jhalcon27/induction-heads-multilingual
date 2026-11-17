@@ -194,29 +194,60 @@ def fmt_heads(heads) -> str:
 
 
 # ---------------------------------------------------------------- ablation
+#
+# Mean ablation replaces a head's output (hook_z) with its average output. The average is
+# computed on a *reference* batch that is never the batch being evaluated: a held-out batch
+# from the same distribution, or (for short texts) the other half of the windows, see
+# `crossfit_ablated_loss`. Zero ablation sets the head's output to 0 and needs no reference.
 
-def mean_ablation_hooks(model, tokens: torch.Tensor, heads) -> list:
-    """Hooks that replace each head's output (hook_z) with its mean over batch and position.
+def head_means(model, reference: torch.Tensor) -> torch.Tensor:
+    """[layer, head, d_head] mean of every head's output (hook_z) over batch and position of `reference`."""
+    names = {f"blocks.{l}.attn.hook_z" for l in range(model.cfg.n_layers)}
+    _, cache = model.run_with_cache(reference, names_filter=lambda n: n in names)
+    return torch.stack([cache["z", l].mean(dim=(0, 1)) for l in range(model.cfg.n_layers)])
 
-    The mean is taken on the same `tokens`, so the head keeps its average contribution
-    but loses all position- and input-specific information.
-    """
+
+def ablation_hooks(heads, means: torch.Tensor | None = None) -> list:
+    """Hooks that replace each head's output with `means[l, h]`, or with 0 if `means` is None."""
     by_layer: dict[int, list[int]] = {}
     for l, h in heads:
         by_layer.setdefault(l, []).append(h)
-    names = {f"blocks.{l}.attn.hook_z" for l in by_layer}
-    _, cache = model.run_with_cache(tokens, names_filter=lambda n: n in names)
 
     hooks = []
     for l, hs in by_layer.items():
-        mean_z = cache[f"blocks.{l}.attn.hook_z"].mean(dim=(0, 1))  # [head, d_head]
-
-        def hook(z, hook, hs=hs, mean_z=mean_z):
-            z[:, :, hs] = mean_z[hs]
+        def hook(z, hook, l=l, hs=hs):
+            z[:, :, hs] = 0.0 if means is None else means[l, hs]
             return z
 
         hooks.append((f"blocks.{l}.attn.hook_z", hook))
     return hooks
+
+
+def ablated_loss(model, tokens, heads, means: torch.Tensor | None = None) -> torch.Tensor:
+    """[batch, 2L] per-token loss with `heads` ablated (mean ablation with `means`, zero ablation if None)."""
+    return per_token_loss(model, tokens, ablation_hooks(heads, means))
+
+
+def two_folds(n: int) -> list[torch.Tensor]:
+    """Interleaved halves of n sequences: even and odd indices."""
+    return [torch.arange(0, n, 2), torch.arange(1, n, 2)]
+
+
+def fold_means(model, tokens: torch.Tensor) -> list[torch.Tensor]:
+    """Head means computed separately on each of the two folds of `tokens`."""
+    return [head_means(model, tokens[idx]) for idx in two_folds(len(tokens))]
+
+
+def crossfit_ablated_loss(model, tokens, heads, folds_means: list[torch.Tensor]) -> torch.Tensor:
+    """Mean-ablated per-token loss where each fold is ablated with the means of the *other* fold.
+
+    For texts too short to hold out a separate batch: every sequence is still evaluated with means
+    computed on sequences it is not part of.
+    """
+    loss = torch.empty(tokens.shape[0], tokens.shape[1] - 1)
+    for k, idx in enumerate(two_folds(len(tokens))):
+        loss[idx] = ablated_loss(model, tokens[idx], heads, folds_means[1 - k])
+    return loss
 
 
 def random_heads(model, k: int, exclude, rng: np.random.Generator) -> list[tuple[int, int]]:
@@ -227,11 +258,6 @@ def random_heads(model, k: int, exclude, rng: np.random.Generator) -> list[tuple
         if (l, h) not in set(exclude)
     ]
     return [pool[i] for i in rng.choice(len(pool), size=k, replace=False)]
-
-
-def ablated_gain(model, tokens, L, heads, mask=None) -> LossSummary:
-    hooks = mean_ablation_hooks(model, tokens, heads)
-    return loss_summary(per_token_loss(model, tokens, hooks), L, mask)
 
 
 def gain_removed(clean: LossSummary, ablated: LossSummary) -> float:
