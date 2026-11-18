@@ -169,13 +169,14 @@ def attention_patterns(model, tokens: torch.Tensor) -> torch.Tensor:
     return torch.stack([cache["pattern", l] for l in range(model.cfg.n_layers)])
 
 
-def induction_scores(patterns: torch.Tensor, L: int) -> torch.Tensor:
-    """[layer, head] mean attention from q (second copy) to q - L + 1.
+def induction_scores(patterns: torch.Tensor, L: int, per_seq: bool = False) -> torch.Tensor:
+    """[layer, head] mean attention from q (second copy) to q - L + 1; [batch, layer, head] if per_seq.
 
     q - L + 1 is the token right after the earlier occurrence of the token at q.
     """
     diag = patterns.diagonal(offset=-(L - 1), dim1=-2, dim2=-1)  # element i = pattern[i+L-1, i]
-    return diag[..., 2:].mean(dim=(1, -1))  # i >= 2  <=>  q >= L+1
+    per = diag[..., 2:].mean(dim=-1)  # [layer, batch, head]; i >= 2  <=>  q >= L+1
+    return per.permute(1, 0, 2) if per_seq else per.mean(dim=1)
 
 
 def prev_token_scores(patterns: torch.Tensor) -> torch.Tensor:
@@ -287,3 +288,50 @@ def ambiguous_share(tokens: torch.Tensor, L: int) -> float:
     first, second = tokens[:, 1 : L + 1], tokens[:, L + 1 : 2 * L + 1]
     counts = second[:, :, None].eq(first[:, None, :]).sum(-1)
     return (counts > 1).float().mean().item()
+
+
+# ---------------------------------------------------------------- bootstrap confidence intervals
+#
+# The resampling unit is the sequence (random-token sequence or text window). Per-sequence sums and
+# counts are stored so every statistic, including ratios such as "% gain removed" and the masked
+# word-initial gain, is recomputed exactly on each resample. Head means for ablation and the choice
+# of top-5 heads stay fixed: the CIs cover which sequences were evaluated, not those choices.
+
+def loss_parts(loss: torch.Tensor, L: int, mask: torch.Tensor | None = None) -> np.ndarray:
+    """[batch, 4] per sequence: (sum, count) of target losses in the first copy, then in the second."""
+    a, b = halves(L)
+    m = torch.ones_like(loss, dtype=torch.bool) if mask is None else mask
+    la, lb, ma, mb = loss[:, a], loss[:, b], m[:, a], m[:, b]
+    return torch.stack([(la * ma).sum(1), ma.sum(1), (lb * mb).sum(1), mb.sum(1)], dim=1).double().numpy()
+
+
+def gain_of(parts: np.ndarray, idx=slice(None)) -> float:
+    """In-context gain (first-copy mean loss - second-copy mean loss) over sequences `idx`."""
+    t = parts[idx].sum(0)
+    return t[0] / t[1] - t[2] / t[3]
+
+
+def removed_of(clean_parts: np.ndarray, ablated_parts: np.ndarray, idx=slice(None)) -> float:
+    """Share of the clean gain removed by ablation, over sequences `idx` (same sequences in both)."""
+    g = gain_of(clean_parts, idx)
+    return (g - gain_of(ablated_parts, idx)) / g
+
+
+def top_heads_per_seq(seq_scores: torch.Tensor, heads) -> np.ndarray:
+    """[batch] mean score of `heads` in each sequence, from [batch, layer, head] scores."""
+    ls, hs = [l for l, _ in heads], [h for _, h in heads]
+    return seq_scores[:, ls, hs].mean(1).double().numpy()
+
+
+def bootstrap_ci(stat, n: int, n_boot: int = 1000, seed: int = 0, level: float = 0.95) -> tuple[float, float]:
+    """Percentile CI of stat(idx), where idx resamples range(n) with replacement."""
+    rng = np.random.default_rng(seed)
+    vals = np.array([stat(rng.integers(0, n, n)) for _ in range(n_boot)])
+    tail = 50 * (1 - level)
+    lo, hi = np.percentile(vals, [tail, 100 - tail])
+    return float(lo), float(hi)
+
+
+def mean_ci(values: np.ndarray, **kw) -> tuple[float, float]:
+    values = np.asarray(values, dtype=float)
+    return bootstrap_ci(lambda i: values[i].mean(), len(values), **kw)
