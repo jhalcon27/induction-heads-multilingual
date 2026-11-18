@@ -14,6 +14,7 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -36,6 +37,7 @@ ARTICLE_MARKER = {
     "sv": r"Artikel (\d+)",
 }
 N_SHARED_ARTICLES = 25
+DATA = Path(__file__).parent / "data"
 
 
 def load_model(name: str = "gpt2-small") -> HookedTransformer:
@@ -96,6 +98,27 @@ def token_windows(model, text: str, L: int, n: int) -> torch.Tensor:
         raise ValueError(f"only {n_avail} windows of {L} tokens available, asked for {n}")
     seq = toks[: n * L].reshape(n, L)
     return repeat(model, seq)
+
+
+def ai_act_recitals(lang: str) -> list[str]:
+    """Recitals 1-180 of the EU AI Act, Regulation (EU) 2024/1689 (see data/ai_act/SOURCE.md)."""
+    return (DATA / "ai_act" / f"recitals_{lang}.txt").read_text(encoding="utf-8").splitlines()
+
+
+def sampled_windows(model, text: str, L: int, n_eval: int, n_heldout: int, seed: int = 0):
+    """Disjoint evaluation and held-out sets of L-token windows, each repeated -> ([n_eval, 2L+1], [n_heldout, 2L+1]).
+
+    The text is cut into consecutive non-overlapping L-token chunks; n_eval + n_heldout of them are drawn
+    at random (fixed seed), so both sets span the whole text. Each set is kept in text order.
+    """
+    toks = tokenize(model, text)
+    n_avail = len(toks) // L
+    if n_avail < n_eval + n_heldout:
+        raise ValueError(f"only {n_avail} windows of {L} tokens available")
+    chunks = toks[: n_avail * L].reshape(n_avail, L)
+    pick = np.random.default_rng(seed).permutation(n_avail)[: n_eval + n_heldout]
+    ev, ho = np.sort(pick[:n_eval]), np.sort(pick[n_eval:])
+    return repeat(model, chunks[torch.as_tensor(ev)]), repeat(model, chunks[torch.as_tensor(ho)])
 
 
 def shuffle_words(text: str, seed: int = 0) -> str:
